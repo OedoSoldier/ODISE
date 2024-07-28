@@ -11,7 +11,6 @@
 import itertools
 import json
 from contextlib import ExitStack
-import gradio as gr
 import torch
 from detectron2.config import instantiate
 from detectron2.data import MetadataCatalog
@@ -31,6 +30,9 @@ from odise.checkpoint import ODISECheckpointer
 from odise.config import instantiate_odise
 from odise.data import get_openseg_labels
 from odise.modeling.wrapper import OpenPanopticInference
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 setup_logger()
 logger = setup_logger(name="odise")
@@ -105,7 +107,7 @@ class VisualizationDemo(object):
         inputs = {"image": image, "height": height, "width": width}
         logger.info("forwarding")
         with autocast():
-            predictions = self.model([inputs])[0]
+            predictions = self.model([inputs])
         logger.info("done")
         return predictions
 
@@ -136,65 +138,6 @@ class VisualizationDemo(object):
                 vis_output = visualizer.draw_instance_predictions(predictions=instances)
 
         return predictions, vis_output
-
-
-models = {}
-for model_name, cfg_name in zip(
-    ["ODISE(Label)", "ODISE(Caption)"],
-    ["Panoptic/odise_label_coco_50e.py", "Panoptic/odise_caption_coco_50e.py"],
-):
-
-    cfg = model_zoo.get_config(cfg_name, trained=True)
-
-    cfg.model.overlap_threshold = 0
-    cfg.model.clip_head.alpha = 0.35
-    cfg.model.clip_head.beta = 0.65
-    cfg.train.device = "cuda" if torch.cuda.is_available() else "cpu"
-    seed_all_rng(42)
-
-    dataset_cfg = cfg.dataloader.test
-    wrapper_cfg = cfg.dataloader.wrapper
-
-    aug = instantiate(dataset_cfg.mapper).augmentations
-
-    model = instantiate_odise(cfg.model)
-    model.to(torch.float16)
-    model.to(cfg.train.device)
-    ODISECheckpointer(model).load(cfg.train.init_checkpoint)
-    models[model_name] = model
-
-
-title = "ODISE"
-description = """
-Gradio demo for ODISE: Open-Vocabulary Panoptic Segmentation with Text-to-Image Diffusion Models. \n
-You may click on of the examples or upload your own image. \n
-
-ODISE could perform open vocabulary segmentation, you may input more classes (separate by comma).
-The expected format is 'a1,a2;b1,b2', where a1,a2 are synonyms vocabularies for the first class. 
-The first word will be displayed as the class name.
-"""  # noqa
-
-article = """
-<p style='text-align: center'><a href='https://arxiv.org/abs/2303.04803' target='_blank'>Open-Vocabulary Panoptic Segmentation with Text-to-Image Diffusion Models</a> | <a href='https://github.com/NVlab/ODISE' target='_blank'>Github Repo</a></p>
-"""  # noqa
-
-examples = [
-    [
-        "demo/examples/coco.jpg",
-        "black pickup truck, pickup truck; blue sky, sky",
-        ["COCO (133 categories)", "ADE (150 categories)", "LVIS (1203 categories)"],
-    ],
-    [
-        "demo/examples/ade.jpg",
-        "luggage, suitcase, baggage;handbag",
-        ["ADE (150 categories)"],
-    ],
-    [
-        "demo/examples/ego4d.jpg",
-        "faucet, tap; kitchen paper, paper towels",
-        ["COCO (133 categories)"],
-    ],
-]
 
 
 def build_demo_classes_and_metadata(vocab, label_list):
@@ -247,16 +190,14 @@ def build_demo_classes_and_metadata(vocab, label_list):
     return demo_classes, demo_metadata
 
 
-def inference(image_path, vocab, label_list, model_name):
+def inference(image_path, vocab, label_list, model, aug):
 
     logger.info("building class names")
     demo_classes, demo_metadata = build_demo_classes_and_metadata(vocab, label_list)
-    if model_name is None:
-        model_name = "ODISE(Label)"
     with ExitStack() as stack:
-        logger.info(f"loading model {model_name}")
+        logger.info(f"loading model")
         inference_model = OpenPanopticInference(
-            model=models[model_name],
+            model=model,
             labels=demo_classes,
             metadata=demo_metadata,
             semantic_on=False,
@@ -268,81 +209,52 @@ def inference(image_path, vocab, label_list, model_name):
 
         demo = VisualizationDemo(inference_model, demo_metadata, aug)
         img = utils.read_image(image_path, format="RGB")
-        _, visualized_output = demo.run_on_image(img)
-        return Image.fromarray(visualized_output.get_image())
+        predictions, _ = demo.run_on_image(img)
+        return img, predictions  # , Image.fromarray(visualized_output.get_image())
 
 
-with gr.Blocks(title=title) as demo:
-    gr.Markdown(
-        "<h1 style='text-align: center; margin-bottom: 1rem'>" + title + "</h1>"
-    )
-    gr.Markdown(description)
-    input_components = []
-    output_components = []
+model_name = "ODISE(Label)"
+cfg_name = "Panoptic/odise_label_coco_50e.py"
 
-    with gr.Row():
-        output_image_gr = gr.outputs.Image(label="Panoptic Segmentation", type="pil")
-        output_components.append(output_image_gr)
+cfg = model_zoo.get_config(cfg_name, trained=True)
 
-    with gr.Row().style(equal_height=True, mobile_collapse=True):
-        with gr.Column(scale=3, variant="panel") as input_component_column:
-            input_image_gr = gr.inputs.Image(type="filepath")
-            model_name_gr = gr.inputs.Dropdown(
-                label="Model",
-                choices=["ODISE(Label)", "ODISE(Caption)"],
-                default="ODISE(Label)",
-            )
-            extra_vocab_gr = gr.inputs.Textbox(default="", label="Extra Vocabulary")
-            category_list_gr = gr.inputs.CheckboxGroup(
-                choices=[
-                    "COCO (133 categories)",
-                    "ADE (150 categories)",
-                    "LVIS (1203 categories)",
-                ],
-                default=[
-                    "COCO (133 categories)",
-                    "ADE (150 categories)",
-                    "LVIS (1203 categories)",
-                ],
-                label="Category to use",
-            )
-            input_components.extend([input_image_gr, extra_vocab_gr, category_list_gr])
+cfg.model.overlap_threshold = 0
+cfg.model.clip_head.alpha = 0.35
+cfg.model.clip_head.beta = 0.65
+cfg.train.device = "cuda" if torch.cuda.is_available() else "cpu"
+seed_all_rng(42)
 
-            # with gr.Column(scale=2):
-            #     examples_handler = gr.Examples(
-            #         examples=examples,
-            #         inputs=[c for c in input_components if not isinstance(c, gr.State)],
-            #         outputs=[c for c in output_components if not isinstance(c, gr.State)],
-            #         fn=inference,
-            #         cache_examples=torch.cuda.is_available(),
-            #         examples_per_page=5,
-            #     )
-            #     with gr.Row():
-            clear_btn = gr.Button("Clear")
-            submit_btn = gr.Button("Submit", variant="primary")
+dataset_cfg = cfg.dataloader.test
+wrapper_cfg = cfg.dataloader.wrapper
 
-    gr.Markdown(article)
+aug = instantiate(dataset_cfg.mapper).augmentations
 
-    submit_btn.click(
-        inference,
-        input_components + [model_name_gr],
-        output_components,
-        api_name="predict",
-        scroll_to_output=True,
-    )
+model = instantiate_odise(cfg.model)
+model.to(torch.float16)
+model.to(cfg.train.device)
+ODISECheckpointer(model).load(cfg.train.init_checkpoint)
 
-    clear_btn.click(
-        None,
-        [],
-        (input_components + output_components + [input_component_column]),
-        _js=f"""() => {json.dumps(
-                    [component.cleared_value if hasattr(component, "cleared_value") else None
-                     for component in input_components + output_components] + (
-                        [gr.Column.update(visible=True)]
-                    )
-                    + ([gr.Column.update(visible=False)])
-                )}
-                """,
-    )
 
-demo.launch()
+img, predictions = inference(
+    "demo/examples/ade.jpg",
+    "",
+    ["COCO (133 categories)"],  # , "ADE (150 categories)", "LVIS (1203 categories)"
+    model,
+    aug,
+)
+
+# plt.figure()
+# plt.imshow(visulaized)
+# plt.show()
+segs, info = predictions[0]["panoptic_seg"]
+ids = [0] + [i["id"] for i in info]
+segs = segs.detach().cpu().numpy()
+
+for id in ids:
+    seg = segs == id
+    # seg = Image.fromarray(img * seg)
+    vis = np.zeros_like(img)
+    vis[seg] = img[seg]
+    plt.figure()
+    plt.imshow(seg)
+    plt.show()

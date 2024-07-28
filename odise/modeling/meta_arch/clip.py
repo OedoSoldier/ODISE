@@ -22,7 +22,9 @@ from .helper import ensemble_logits_with_labels
 
 logger = logging.getLogger(__name__)
 
-EmbeddedText = namedtuple("EmbedTextReturn", ["text_embed", "text_encodings", "text_mask"])
+EmbeddedText = namedtuple(
+    "EmbedTextReturn", ["text_embed", "text_encodings", "text_mask"]
+)
 EmbeddedImage = namedtuple("EmbedImageReturn", ["image_embed", "image_encodings"])
 
 
@@ -65,10 +67,10 @@ def build_clip_text_embed(clip_model_name, labels, device="cuda", verbose=True):
         text_embed_list.extend(list(text_embed))
 
     out_text_embed = torch.stack(text_embed_list)
-    if verbose:
-        logger.info(
-            f"Built text_embed of shape {out_text_embed.shape} for {len(labels)} labels: {labels}"  # noqa
-        )
+    # if verbose:
+    #     logger.info(
+    #         f"Built text_embed of shape {out_text_embed.shape} for {len(labels)} labels: {labels}"  # noqa
+    #     )
 
     return out_text_embed
 
@@ -91,7 +93,9 @@ class ClipAdapter(nn.Module):
 
         # self.clip_normalize = preprocess.transforms[-1]
         # the first two are Resize and Crop, the last one is normalization
-        self.clip_preprocess = T.Compose([*preprocess.transforms[:2], preprocess.transforms[-1]])
+        self.clip_preprocess = T.Compose(
+            [*preprocess.transforms[:2], preprocess.transforms[-1]]
+        )
         self._freeze()
         self.name = name
         self.normalize = normalize
@@ -156,7 +160,9 @@ class ClipAdapter(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        text_embed = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.clip.text_projection
+        text_embed = (
+            x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.clip.text_projection
+        )
 
         return text_embed, text_encodings
 
@@ -169,7 +175,9 @@ class ClipAdapter(nn.Module):
         text_embed, text_encodings = self._encode_text(text)
         if self.normalize:
             return EmbeddedText(
-                F.normalize(text_embed.float(), dim=-1), text_encodings.float(), text_mask
+                F.normalize(text_embed.float(), dim=-1),
+                text_encodings.float(),
+                text_mask,
             )
         else:
             return EmbeddedText(text_embed.float(), text_encodings.float(), text_mask)
@@ -182,7 +190,9 @@ class ClipAdapter(nn.Module):
             x = torch.cat(
                 [
                     self.clip.visual.class_embedding.to(x.dtype)
-                    + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+                    + torch.zeros(
+                        x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+                    ),
                     x,
                 ],
                 dim=1,
@@ -208,7 +218,9 @@ class ClipAdapter(nn.Module):
 
             width = height = int(image_encodings.shape[1] ** 0.5)
 
-            image_encodings = rearrange(image_encodings, "b (h w) c -> b c h w", h=height, w=width)
+            image_encodings = rearrange(
+                image_encodings, "b (h w) c -> b c h w", h=height, w=width
+            )
 
             image_encodings = F.interpolate(
                 image_encodings,
@@ -226,7 +238,9 @@ class ClipAdapter(nn.Module):
     def embed_image(self, image):
         image_embed, image_encodings = self._encode_image(self.clip_preprocess(image))
         if self.normalize:
-            return EmbeddedImage(F.normalize(image_embed.float(), dim=-1), image_encodings)
+            return EmbeddedImage(
+                F.normalize(image_embed.float(), dim=-1), image_encodings
+            )
         else:
             return EmbeddedImage(image_embed.float(), image_encodings)
 
@@ -249,14 +263,18 @@ class MaskCLIP(ClipAdapter):
         logit_scale = torch.clamp(self.clip.logit_scale.exp(), max=100)
         return logit_scale
 
-    def _mask_clip_forward(self, x: torch.Tensor, attn_mask: torch.Tensor, num_mask_tokens: int):
+    def _mask_clip_forward(
+        self, x: torch.Tensor, attn_mask: torch.Tensor, num_mask_tokens: int
+    ):
         x = self.clip.visual.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat(
             [
                 self.clip.visual.class_embedding.to(x.dtype)
-                + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+                + torch.zeros(
+                    x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+                ),
                 x,
             ],
             dim=1,
@@ -318,7 +336,9 @@ class MaskCLIP(ClipAdapter):
         attn_mask[:, :num_mask_token, -num_image_token:] = mask_token_attn_mask
         num_heads = self.clip.visual.conv1.out_channels // 64  # head width 64
         attn_mask = attn_mask.unsqueeze(1).expand(-1, num_heads, -1, -1)
-        attn_mask = attn_mask.reshape(batch_size * num_heads, num_all_token, num_all_token)
+        attn_mask = attn_mask.reshape(
+            batch_size * num_heads, num_all_token, num_all_token
+        )
 
         return self._mask_clip_forward(image, attn_mask, num_mask_token)
 
@@ -330,7 +350,9 @@ class MaskCLIP(ClipAdapter):
             mode="bilinear",
             align_corners=False,
         )
-        mask = F.interpolate(mask, size=image.shape[-2:], mode="bilinear", align_corners=False)
+        mask = F.interpolate(
+            mask, size=image.shape[-2:], mode="bilinear", align_corners=False
+        )
 
         # [B, Q, C]
         mask_embed = self.encode_image_with_mask(image, mask)
@@ -340,7 +362,9 @@ class MaskCLIP(ClipAdapter):
     def pred_logits(self, mask_embed, text_embed, labels):
         logit_per_mask = (
             torch.einsum(
-                "bqc,nc->bqn", F.normalize(mask_embed, dim=-1), F.normalize(text_embed, dim=-1)
+                "bqc,nc->bqn",
+                F.normalize(mask_embed, dim=-1),
+                F.normalize(text_embed, dim=-1),
             )
             * self.logit_scale
         )
@@ -356,6 +380,8 @@ class MaskCLIP(ClipAdapter):
 
         if text_embed is not None and labels is not None:
 
-            output["mask_pred_open_logits"] = self.pred_logits(mask_embed, text_embed, labels)
+            output["mask_pred_open_logits"] = self.pred_logits(
+                mask_embed, text_embed, labels
+            )
 
         return output

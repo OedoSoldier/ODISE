@@ -48,7 +48,9 @@ def _concat_all_gather(tensor):
     """
     if comm.get_world_size() == 1:
         return tensor
-    tensors_gather = [torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())]
+    tensors_gather = [
+        torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())
+    ]
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
     output = torch.cat(tensors_gather, dim=0)
@@ -77,7 +79,11 @@ def concat_all_gather(tensor):
     padded_tensor[: tensor.shape[0]] = tensor
 
     tensors_gather = [
-        torch.ones((max_batch_size, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        torch.ones(
+            (max_batch_size, *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
         for _ in range(comm.get_world_size())
     ]
     torch.distributed.all_gather(tensors_gather, padded_tensor, async_op=False)
@@ -105,7 +111,11 @@ def dist_collect(tensor):
     padded_tensor[: tensor.shape[0]] = tensor
 
     tensors_gather = [
-        torch.ones((max_batch_size, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        torch.ones(
+            (max_batch_size, *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
         for _ in range(comm.get_world_size())
     ]
     tensors_gather = diff_dist.all_gather(tensors_gather, padded_tensor)
@@ -181,13 +191,17 @@ class CategoryODISE(ODISE):
     def cal_pred_logits(self, outputs):
         # [B, Q, C]
         mask_embed = outputs["mask_embed"]
+        print(mask_embed.size())
         # [K, C]
         text_embed = outputs["text_embed"]
         # [1, C]
         text_embed = outputs["text_embed"]
+        print("text_embed", text_embed.size(), text_embed)
         null_embed = outputs["null_embed"]
+        print("null_embed", null_embed.size(), null_embed)
 
         labels = outputs["labels"]
+        print(labels)
 
         mask_embed = F.normalize(mask_embed, dim=-1)
         text_embed = F.normalize(text_embed, dim=-1)
@@ -195,16 +209,81 @@ class CategoryODISE(ODISE):
 
         # [B, Q, K]
         pred = logit_scale * (mask_embed @ text_embed.t())
+        # pred = logit_scale * mask_embed
 
         pred = ensemble_logits_with_labels(pred, labels, ensemble_method="max")
 
         null_embed = F.normalize(null_embed, dim=-1)
         null_pred = logit_scale * (mask_embed @ null_embed.t())
 
-        # [B, Q, K+1]
+        # # [B, Q, K+1]
         pred = torch.cat([pred, null_pred], dim=-1)
+        print(pred.size(), pred)
 
         return pred
+
+    def panoptic_inference(self, mask_cls, mask_pred):
+        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        mask_pred = mask_pred.sigmoid()
+
+        keep = labels.ne(self.sem_seg_head.num_classes) & (
+            scores > self.object_mask_threshold
+        )
+        cur_scores = scores[keep]
+        cur_classes = labels[keep]
+        cur_masks = mask_pred[keep]
+        cur_mask_cls = mask_cls[keep]
+        cur_mask_cls = cur_mask_cls[:, :-1]
+
+        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
+
+        h, w = cur_masks.shape[-2:]
+        panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
+        segments_info = []
+
+        current_segment_id = 0
+
+        if cur_masks.shape[0] == 0:
+            # We didn't detect any mask :(
+            return panoptic_seg, segments_info
+        else:
+            # take argmax
+            cur_mask_ids = cur_prob_masks.argmax(0)
+            stuff_memory_list = {}
+            for k in range(cur_classes.shape[0]):
+                pred_class = cur_classes[k].item()
+                isthing = (
+                    pred_class
+                    in self.metadata.thing_dataset_id_to_contiguous_id.values()
+                )
+                mask_area = (cur_mask_ids == k).sum().item()
+                original_area = (cur_masks[k] >= 0.5).sum().item()
+                mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
+
+                if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
+                    if mask_area / original_area < self.overlap_threshold:
+                        continue
+
+                    # merge stuff regions
+                    if not isthing:
+                        if int(pred_class) in stuff_memory_list.keys():
+                            panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                            continue
+                        else:
+                            stuff_memory_list[int(pred_class)] = current_segment_id + 1
+
+                    current_segment_id += 1
+                    panoptic_seg[mask] = current_segment_id
+
+                    segments_info.append(
+                        {
+                            "id": current_segment_id,
+                            "isthing": bool(isthing),
+                            "category_id": int(pred_class),
+                        }
+                    )
+
+            return panoptic_seg, segments_info
 
     def forward(self, batched_inputs):
         """
@@ -283,44 +362,45 @@ class CategoryODISE(ODISE):
 
             # get text_embeddings
             outputs.update(self.category_head(outputs))
-
+            print(outputs.keys())
             outputs["pred_logits"] = self.cal_pred_logits(outputs)
 
             mask_pred_results = outputs["pred_masks"]
             mask_cls_results = outputs["pred_logits"]
+            print(mask_cls_results)
 
-            if self.clip_head is not None:
-                if self.clip_head.with_bg:
-                    # [B, Q, K+1]
-                    outputs["pred_open_logits"] = outputs["pred_logits"]
-                    outputs.update(self.clip_head(outputs))
-                    mask_cls_results = outputs["pred_open_logits"]
-                else:
-                    # [B, Q, K]
-                    outputs["pred_open_logits"] = outputs["pred_logits"][..., :-1]
-                    outputs.update(self.clip_head(outputs))
+            # if self.clip_head is not None:
+            #     if self.clip_head.with_bg:
+            #         # [B, Q, K+1]
+            #         outputs["pred_open_logits"] = outputs["pred_logits"]
+            #         outputs.update(self.clip_head(outputs))
+            #         mask_cls_results = outputs["pred_open_logits"]
+            #     else:
+            #         # [B, Q, K]
+            #         outputs["pred_open_logits"] = outputs["pred_logits"][..., :-1]
+            #         outputs.update(self.clip_head(outputs))
 
-                    # merge with bg scores
-                    open_logits = outputs["pred_open_logits"]
+            #         # merge with bg scores
+            #         open_logits = outputs["pred_open_logits"]
 
-                    # in case the prediction is not binary
-                    binary_probs = torch.zeros(
-                        (mask_cls_results.shape[0], mask_cls_results.shape[1], 2),
-                        device=mask_cls_results.device,
-                        dtype=mask_cls_results.dtype,
-                    )
-                    binary_probs[..., -1] = F.softmax(mask_cls_results, dim=-1)[..., -1]
-                    binary_probs[..., 0] = 1 - binary_probs[..., -1]
+            #         # in case the prediction is not binary
+            #         binary_probs = torch.zeros(
+            #             (mask_cls_results.shape[0], mask_cls_results.shape[1], 2),
+            #             device=mask_cls_results.device,
+            #             dtype=mask_cls_results.dtype,
+            #         )
+            #         binary_probs[..., -1] = F.softmax(mask_cls_results, dim=-1)[..., -1]
+            #         binary_probs[..., 0] = 1 - binary_probs[..., -1]
 
-                    masks_class_probs = F.softmax(open_logits, dim=-1)
-                    # [B, Q, K+1]
-                    mask_cls_results = torch.cat(
-                        [masks_class_probs * binary_probs[..., 0:1], binary_probs[..., 1:2]], dim=-1
-                    )
-                    # NOTE: mask_cls_results is already multiplied with logit_scale,
-                    # avoid double scale, which cause overflow in softmax
-                    # mask_cls_results = torch.log(mask_cls_results + 1e-8) * outputs["logit_scale"]
-                    mask_cls_results = torch.log(mask_cls_results + 1e-8)
+            #         masks_class_probs = F.softmax(open_logits, dim=-1)
+            #         # [B, Q, K+1]
+            #         mask_cls_results = torch.cat(
+            #             [masks_class_probs * binary_probs[..., 0:1], binary_probs[..., 1:2]], dim=-1
+            #         )
+            #         # NOTE: mask_cls_results is already multiplied with logit_scale,
+            #         # avoid double scale, which cause overflow in softmax
+            #         # mask_cls_results = torch.log(mask_cls_results + 1e-8) * outputs["logit_scale"]
+            #         mask_cls_results = torch.log(mask_cls_results + 1e-8)
 
             # upsample masks
             mask_pred_results = F.interpolate(
@@ -352,7 +432,9 @@ class CategoryODISE(ODISE):
                         mask_cls_result, mask_pred_result
                     )
                     if not self.sem_seg_postprocess_before_inference:
-                        r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
+                        r = retry_if_cuda_oom(sem_seg_postprocess)(
+                            r, image_size, height, width
+                        )
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
@@ -394,7 +476,9 @@ class CaptionODISE(ODISE):
             # pad gt
             gt_masks = targets_per_image.gt_masks
             padded_masks = torch.zeros(
-                (gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device
+                (gt_masks.shape[0], h_pad, w_pad),
+                dtype=gt_masks.dtype,
+                device=gt_masks.device,
             )
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
             new_targets.append(
@@ -406,7 +490,9 @@ class CaptionODISE(ODISE):
 
             if targets_per_image.has("original_gt_classes"):
                 # "labels" maybe binary, store original labels in as well
-                new_targets[-1]["original_labels"] = targets_per_image.original_gt_classes
+                new_targets[-1][
+                    "original_labels"
+                ] = targets_per_image.original_gt_classes
 
         return new_targets
 
@@ -415,7 +501,9 @@ class CaptionODISE(ODISE):
         new_targets = []
         for _ in range(len(images)):
             # pad gt
-            padded_masks = torch.zeros((0, h_pad, w_pad), dtype=torch.bool, device=images.device)
+            padded_masks = torch.zeros(
+                (0, h_pad, w_pad), dtype=torch.bool, device=images.device
+            )
             new_targets.append(
                 {
                     "labels": torch.zeros(0, dtype=torch.long, device=images.device),
@@ -495,8 +583,12 @@ class CaptionODISE(ODISE):
                 if self.binary_classification:
                     # NOTE: convert to binary classification target
                     for i in range(len(gt_instances)):
-                        gt_instances[i].original_gt_classes = gt_instances[i].gt_classes.clone()
-                        gt_instances[i].gt_classes = torch.zeros_like(gt_instances[i].gt_classes)
+                        gt_instances[i].original_gt_classes = gt_instances[
+                            i
+                        ].gt_classes.clone()
+                        gt_instances[i].gt_classes = torch.zeros_like(
+                            gt_instances[i].gt_classes
+                        )
 
                 targets = self.prepare_targets(gt_instances, images)
                 has_anno = True
@@ -562,7 +654,8 @@ class CaptionODISE(ODISE):
             masks_class_probs = F.softmax(open_logits, dim=-1)
             # [B, Q, K+1]
             mask_cls_results = torch.cat(
-                [masks_class_probs * binary_probs[..., 0:1], binary_probs[..., 1:2]], dim=-1
+                [masks_class_probs * binary_probs[..., 0:1], binary_probs[..., 1:2]],
+                dim=-1,
             )
             # NOTE: mask_cls_results is already multiplied with logit_scale,
             # avoid double scale, which cause overflow in softmax
@@ -599,7 +692,9 @@ class CaptionODISE(ODISE):
                         mask_cls_result, mask_pred_result
                     )
                     if not self.sem_seg_postprocess_before_inference:
-                        r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
+                        r = retry_if_cuda_oom(sem_seg_postprocess)(
+                            r, image_size, height, width
+                        )
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
@@ -638,6 +733,39 @@ class ODISEMultiScaleMaskedTransformerDecoder(MultiScaleMaskedTransformerDecoder
         if post_mask_embed is not None:
             assert mask_embed is None
         self.post_mask_embed = post_mask_embed
+        # self.iou_prediction_head = MLP(
+        #     transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
+        # )
+        self.iou_token = nn.Embedding(1, kwargs["hidden_dim"])
+
+    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
+        decoder_output = self.decoder_norm(output)
+        decoder_output = decoder_output.transpose(0, 1)
+        outputs_class = self.class_embed(decoder_output)
+        mask_embed = self.mask_embed(decoder_output)
+        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+
+        # NOTE: prediction is of higher-resolution
+        # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
+        attn_mask = F.interpolate(
+            outputs_mask,
+            size=attn_mask_target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        # must use bool type
+        # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
+        attn_mask = (
+            attn_mask.sigmoid()
+            .flatten(2)
+            .unsqueeze(1)
+            .repeat(1, self.num_heads, 1, 1)
+            .flatten(0, 1)
+            < 0.5
+        ).bool()
+        attn_mask = attn_mask.detach()
+
+        return outputs_class, outputs_mask, attn_mask
 
     def forward(self, x, mask_features, mask=None, *, inputs_dict=None):
         # x is a list of multi-scale feature
@@ -653,7 +781,8 @@ class ODISEMultiScaleMaskedTransformerDecoder(MultiScaleMaskedTransformerDecoder
             size_list.append(x[i].shape[-2:])
             pos.append(self.pe_layer(x[i], None).flatten(2))
             src.append(
-                self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None]
+                self.input_proj[i](x[i]).flatten(2)
+                + self.level_embed.weight[i][None, :, None]
             )
 
             # flatten NxCxHxW to HWxNxC
@@ -671,8 +800,13 @@ class ODISEMultiScaleMaskedTransformerDecoder(MultiScaleMaskedTransformerDecoder
         predictions_extra_results = []
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask, extra_results = self.forward_prediction_heads(
-            output, mask_features, attn_mask_target_size=size_list[0], inputs_dict=inputs_dict
+        outputs_class, outputs_mask, attn_mask, extra_results = (
+            self.forward_prediction_heads(
+                output,
+                mask_features,
+                attn_mask_target_size=size_list[0],
+                inputs_dict=inputs_dict,
+            )
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
@@ -698,11 +832,13 @@ class ODISEMultiScaleMaskedTransformerDecoder(MultiScaleMaskedTransformerDecoder
             # FFN
             output = self.transformer_ffn_layers[i](output)
 
-            outputs_class, outputs_mask, attn_mask, extra_results = self.forward_prediction_heads(
-                output,
-                mask_features,
-                attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
-                inputs_dict=inputs_dict,
+            outputs_class, outputs_mask, attn_mask, extra_results = (
+                self.forward_prediction_heads(
+                    output,
+                    mask_features,
+                    attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
+                    inputs_dict=inputs_dict,
+                )
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -714,7 +850,8 @@ class ODISEMultiScaleMaskedTransformerDecoder(MultiScaleMaskedTransformerDecoder
             "pred_logits": predictions_class[-1],
             "pred_masks": predictions_mask[-1],
             "aux_outputs": self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
+                predictions_class if self.mask_classification else None,
+                predictions_mask,
             ),
         }
 
@@ -758,7 +895,10 @@ class ODISEMultiScaleMaskedTransformerDecoder(MultiScaleMaskedTransformerDecoder
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
         attn_mask = F.interpolate(
-            outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False
+            outputs_mask,
+            size=attn_mask_target_size,
+            mode="bilinear",
+            align_corners=False,
         )
         # must use bool type
         # If a BoolTensor is provided, positions with ``True`` are not allowed to attend,
@@ -797,7 +937,9 @@ class MaskGroundingCriterion(nn.Module):
             raise ValueError(f"collect_mode {collect_mode} is not supported")
 
     def extra_repr(self) -> str:
-        return f"collect_mode={self.collect_mode}, \n" f"loss_weight={self.loss_weight} \n"
+        return (
+            f"collect_mode={self.collect_mode}, \n" f"loss_weight={self.loss_weight} \n"
+        )
 
     def forward(self, outputs, targets):
 
@@ -830,7 +972,9 @@ class MaskGroundingCriterion(nn.Module):
         word_embed = F.normalize(word_embed, dim=-1)
 
         batch_size, num_queries, embed_dim = mask_embed.shape
-        assert batch_size == word_embed.shape[0], f"{batch_size} != {word_embed.shape[0]}"
+        assert (
+            batch_size == word_embed.shape[0]
+        ), f"{batch_size} != {word_embed.shape[0]}"
         assert embed_dim == word_embed.shape[2], f"{embed_dim} != {word_embed.shape[2]}"
         num_words = word_embed.shape[1]
 
@@ -840,14 +984,18 @@ class MaskGroundingCriterion(nn.Module):
         word_embed = word_embed.reshape(batch_size * num_words, embed_dim)
 
         if self.collect_mode is not None and comm.get_world_size() > 1:
-            global_batch_sizes = get_world_batch_sizes(batch_size, device=mask_embed.device)
+            global_batch_sizes = get_world_batch_sizes(
+                batch_size, device=mask_embed.device
+            )
             global_batch_size = global_batch_sizes.sum().item()
         else:
             global_batch_sizes = None
             global_batch_size = batch_size
 
         # [W*B*Q, B*K]
-        sim_global_mask_word = self.collect_func(mask_embed) @ word_embed.t() * logit_scale
+        sim_global_mask_word = (
+            self.collect_func(mask_embed) @ word_embed.t() * logit_scale
+        )
 
         # [W*B, Q, B, K]
         sim_global_mask_word = sim_global_mask_word.view(
@@ -856,11 +1004,15 @@ class MaskGroundingCriterion(nn.Module):
 
         # [W*B, B]
         sim_global_img_txt = (
-            (sim_global_mask_word.softmax(dim=1) * sim_global_mask_word).sum(dim=1).mean(dim=-1)
+            (sim_global_mask_word.softmax(dim=1) * sim_global_mask_word)
+            .sum(dim=1)
+            .mean(dim=-1)
         )
 
         # [B*Q, W*B*K]
-        sim_mask_global_word = mask_embed @ self.collect_func(word_embed).t() * logit_scale
+        sim_mask_global_word = (
+            mask_embed @ self.collect_func(word_embed).t() * logit_scale
+        )
 
         # [B, Q, W*B, K]
         sim_mask_global_word = sim_mask_global_word.view(
@@ -869,7 +1021,9 @@ class MaskGroundingCriterion(nn.Module):
 
         # [B, W*B]
         sim_img_global_txt = (
-            (sim_mask_global_word.softmax(dim=1) * sim_mask_global_word).sum(dim=1).mean(dim=-1)
+            (sim_mask_global_word.softmax(dim=1) * sim_mask_global_word)
+            .sum(dim=1)
+            .mean(dim=-1)
         )
 
         if global_batch_sizes is None:
@@ -891,7 +1045,9 @@ class MaskGroundingCriterion(nn.Module):
         global_valid_mask = self.collect_func(valid_mask)
 
         # [WxB, B] -> [B, WXB] -> [B]
-        loss_global_img_txt = F.cross_entropy(sim_global_img_txt.t(), labels, reduction="none")
+        loss_global_img_txt = F.cross_entropy(
+            sim_global_img_txt.t(), labels, reduction="none"
+        )
         loss_global_img_txt = (loss_global_img_txt * valid_mask).mean()
 
         # [B, WXB] -> [B]
@@ -914,7 +1070,9 @@ class PseudoClassEmbed(nn.Module):
 
     def forward(self, x):
         # predict as foreground only
-        fg_logits = torch.ones((*x.shape[:-1], self.num_classes), dtype=x.dtype, device=x.device)
+        fg_logits = torch.ones(
+            (*x.shape[:-1], self.num_classes), dtype=x.dtype, device=x.device
+        )
         bg_logits = torch.zeros((*x.shape[:-1], 1), dtype=x.dtype, device=x.device)
         logits = torch.cat([fg_logits, bg_logits], dim=-1)
         return logits
@@ -932,7 +1090,10 @@ class MaskPooling(nn.Module):
         self.mask_threshold = mask_threshold
 
     def extra_repr(self) -> str:
-        return f"hard_pooling={self.hard_pooling}\n" f"mask_threshold={self.mask_threshold}\n"
+        return (
+            f"hard_pooling={self.hard_pooling}\n"
+            f"mask_threshold={self.mask_threshold}\n"
+        )
 
     def forward(self, x, mask):
         """
@@ -972,7 +1133,9 @@ class PooledMaskEmbed(nn.Module):
         temperature=0.07,
     ):
         super().__init__()
-        self.pool_proj = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
+        self.pool_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim)
+        )
         self.mask_embed = nn.Sequential(
             nn.LayerNorm(mask_dim), MLP(mask_dim, hidden_dim, projection_dim, 3)
         )
@@ -981,7 +1144,9 @@ class PooledMaskEmbed(nn.Module):
 
         self.mask_pooling = MaskPooling()
 
-    def forward(self, decoder_output, input_mask_embed, mask_features, pred_logits, pred_masks):
+    def forward(
+        self, decoder_output, input_mask_embed, mask_features, pred_logits, pred_masks
+    ):
         """
         Args:
             decoder_output: [B, Q, C]
@@ -1095,7 +1260,9 @@ class WordEmbed(nn.Module):
             text_embed = self.build_text_embed(labels, verbose=True)
             if len(self._test_text_embed_dict) > 3:
                 # pop the first element, only caching 3 elements
-                self._test_text_embed_dict.pop(list(self._test_text_embed_dict.keys())[0])
+                self._test_text_embed_dict.pop(
+                    list(self._test_text_embed_dict.keys())[0]
+                )
             self._test_text_embed_dict[labels] = text_embed.cpu()
         else:
             text_embed = self._test_text_embed_dict[labels].to(self.device)
@@ -1105,7 +1272,9 @@ class WordEmbed(nn.Module):
         if not isinstance(tags, (list, tuple)):
             tags = [tags]
         ret = []
-        for (word, pos) in self.nltk.pos_tag(self.nltk.word_tokenize(caption), tagset="universal"):
+        for word, pos in self.nltk.pos_tag(
+            self.nltk.word_tokenize(caption), tagset="universal"
+        ):
             for tag in tags:
                 if pos == tag:
                     ret.append(word)
@@ -1140,7 +1309,9 @@ class WordEmbed(nn.Module):
 
         for subtree in chunked:
             if isinstance(subtree, self.nltk.Tree):
-                current_chunk.append(" ".join([token for token, pos in subtree.leaves()]))
+                current_chunk.append(
+                    " ".join([token for token, pos in subtree.leaves()])
+                )
             elif current_chunk:
                 named_entity = " ".join(current_chunk)
                 if named_entity not in continuous_chunk:
@@ -1170,14 +1341,20 @@ class WordEmbed(nn.Module):
             elif "noun_phrase" in self.word_tags:
                 words = []
                 words.extend(self.get_noun_phrase(caption))
-                words.extend(self.get_tag(caption, tuple(set(self.word_tags) - set("noun_phrase"))))
+                words.extend(
+                    self.get_tag(
+                        caption, tuple(set(self.word_tags) - set("noun_phrase"))
+                    )
+                )
                 words = list(set(words))
             else:
                 words = self.get_tag(caption, self.word_tags)
             if not len(words):
                 words = [""]
             # drop with probability
-            words_after_drop = [w for w in words if np.random.rand() > self.word_dropout]
+            words_after_drop = [
+                w for w in words if np.random.rand() > self.word_dropout
+            ]
             if len(words_after_drop) == 0:
                 # Fall back to no drop if all words are dropped
                 words_after_drop = words
@@ -1236,7 +1413,9 @@ class CategoryEmbed(nn.Module):
             self.text_proj = nn.Linear(self.clip.dim_latent, projection_dim)
 
         self.register_buffer(
-            "text_embed", self.build_text_embed(prompt_labels(labels, prompt), verbose=True), False
+            "text_embed",
+            self.build_text_embed(prompt_labels(labels, prompt), verbose=True),
+            False,
         )
         self.null_embed = nn.Parameter(self.build_text_embed(""))
 
@@ -1293,18 +1472,28 @@ class CategoryEmbed(nn.Module):
             text_embed = self.text_proj(self.text_embed)
             null_embed = self.text_proj(self.null_embed)
 
-            return {"text_embed": text_embed, "null_embed": null_embed, "labels": self.labels}
+            return {
+                "text_embed": text_embed,
+                "null_embed": null_embed,
+                "labels": self.labels,
+            }
 
         else:
             assert targets is None
             assert self.test_labels is not None
             labels = self.test_labels
-            text_embed = self.get_and_cache_test_text_embed(prompt_labels(labels, self.prompt))
+            text_embed = self.get_and_cache_test_text_embed(
+                prompt_labels(labels, self.prompt)
+            )
 
             text_embed = self.text_proj(text_embed)
             null_embed = self.text_proj(self.null_embed)
 
-            return {"text_embed": text_embed, "null_embed": null_embed, "labels": labels}
+            return {
+                "text_embed": text_embed,
+                "null_embed": null_embed,
+                "labels": labels,
+            }
 
 
 class CLIPOpenClassEmbed(nn.Module):
@@ -1332,9 +1521,13 @@ class CLIPOpenClassEmbed(nn.Module):
             self.null_embed = None
 
         if self.projection_modality == "text":
-            self.embed_projection = nn.Linear(self.text_embed.shape[-1], hidden_dim, bias=False)
+            self.embed_projection = nn.Linear(
+                self.text_embed.shape[-1], hidden_dim, bias=False
+            )
         else:
-            self.embed_projection = nn.Linear(hidden_dim, self.text_embed.shape[-1], bias=False)
+            self.embed_projection = nn.Linear(
+                hidden_dim, self.text_embed.shape[-1], bias=False
+            )
 
         assert ensemble_method in [
             "max",
@@ -1404,7 +1597,9 @@ class CLIPOpenClassEmbed(nn.Module):
         # [B, Q, K]
         pred = logit_scale * (x @ text_embed.t())
 
-        pred = ensemble_logits_with_labels(pred, labels, ensemble_method=self.ensemble_method)
+        pred = ensemble_logits_with_labels(
+            pred, labels, ensemble_method=self.ensemble_method
+        )
 
         if self.null_embed is not None:
             if self.projection_modality == "text":
@@ -1444,7 +1639,9 @@ class PoolingCLIPHead(WordEmbed):
 
         self.prompt = prompt
         if train_labels is None:
-            self.train_labels = get_openseg_labels("coco_panoptic", prompt_engineered=True)
+            self.train_labels = get_openseg_labels(
+                "coco_panoptic", prompt_engineered=True
+            )
         else:
             self.train_labels = train_labels
         self.bg_labels = bg_labels
@@ -1459,7 +1656,9 @@ class PoolingCLIPHead(WordEmbed):
 
     def prepare_targets(self, outputs, targets):
 
-        target_mask_embed = self.clip.get_mask_embed(outputs["images"], outputs["pred_masks"])
+        target_mask_embed = self.clip.get_mask_embed(
+            outputs["images"], outputs["pred_masks"]
+        )
 
         for idx in range(len(targets)):
             targets[idx]["target_mask_embed"] = target_mask_embed[idx]
@@ -1481,7 +1680,9 @@ class PoolingCLIPHead(WordEmbed):
         train_labels = {l for label in self.train_labels for l in label}
 
         for test_label in self.test_labels:
-            category_overlapping_list.append(not set(train_labels).isdisjoint(set(test_label)))
+            category_overlapping_list.append(
+                not set(train_labels).isdisjoint(set(test_label))
+            )
 
         if self.with_bg and pred_open_logits.shape[-1] == len(self.test_labels) + 1:
             category_overlapping_list.append(False)
@@ -1511,13 +1712,17 @@ class PoolingCLIPHead(WordEmbed):
             # NOTE: logits are multiplied with logit_scale,
             # avoid double scale, which cause overflow in softmax
             pred_open_logits_base = (
-                (pred_open_prob ** (1 - self.alpha) * mask_pred_open_prob**self.alpha).log()
+                (
+                    pred_open_prob ** (1 - self.alpha) * mask_pred_open_prob**self.alpha
+                ).log()
                 # * outputs["logit_scale"]
                 * category_overlapping_mask
             )
 
             pred_open_logits_novel = (
-                (pred_open_prob ** (1 - self.beta) * mask_pred_open_prob**self.beta).log()
+                (
+                    pred_open_prob ** (1 - self.beta) * mask_pred_open_prob**self.beta
+                ).log()
                 # * outputs["logit_scale"]
                 * (1 - category_overlapping_mask)
             )
@@ -1540,3 +1745,30 @@ class PoolingCLIPHead(WordEmbed):
             ret["labels"] = labels
 
         return ret
+
+
+# Lightly adapted from
+# https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py # noqa
+class MLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        num_layers: int,
+        sigmoid_output: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(
+            nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim])
+        )
+        self.sigmoid_output = sigmoid_output
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        if self.sigmoid_output:
+            x = F.sigmoid(x)
+        return x
