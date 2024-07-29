@@ -236,7 +236,7 @@ ODISECheckpointer(model).load(cfg.train.init_checkpoint)
 
 
 img, predictions = inference(
-    "demo/examples/ade.jpg",
+    "demo/examples/coco.jpg",
     "",
     ["COCO (133 categories)"],  # , "ADE (150 categories)", "LVIS (1203 categories)"
     model,

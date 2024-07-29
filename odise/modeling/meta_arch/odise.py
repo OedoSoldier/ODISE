@@ -223,20 +223,7 @@ class CategoryODISE(ODISE):
         return pred
 
     def panoptic_inference(self, mask_cls, mask_pred):
-        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
-        mask_pred = mask_pred.sigmoid()
-
-        keep = labels.ne(self.sem_seg_head.num_classes) & (
-            scores > self.object_mask_threshold
-        )
-        cur_scores = scores[keep]
-        cur_classes = labels[keep]
-        cur_masks = mask_pred[keep]
-        cur_mask_cls = mask_cls[keep]
-        cur_mask_cls = cur_mask_cls[:, :-1]
-
-        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
-
+        cur_masks = mask_pred
         h, w = cur_masks.shape[-2:]
         panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
         segments_info = []
@@ -247,30 +234,13 @@ class CategoryODISE(ODISE):
             # We didn't detect any mask :(
             return panoptic_seg, segments_info
         else:
-            # take argmax
-            cur_mask_ids = cur_prob_masks.argmax(0)
-            stuff_memory_list = {}
-            for k in range(cur_classes.shape[0]):
-                pred_class = cur_classes[k].item()
-                isthing = (
-                    pred_class
-                    in self.metadata.thing_dataset_id_to_contiguous_id.values()
-                )
-                mask_area = (cur_mask_ids == k).sum().item()
+            for k in range(cur_masks.shape[0]):
                 original_area = (cur_masks[k] >= 0.5).sum().item()
-                mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
+                mask = cur_masks[k] >= 0.5
 
-                if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
-                    if mask_area / original_area < self.overlap_threshold:
+                if original_area > 0 and mask.sum().item() > 0:
+                    if original_area < self.overlap_threshold:
                         continue
-
-                    # merge stuff regions
-                    if not isthing:
-                        if int(pred_class) in stuff_memory_list.keys():
-                            panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
-                            continue
-                        else:
-                            stuff_memory_list[int(pred_class)] = current_segment_id + 1
 
                     current_segment_id += 1
                     panoptic_seg[mask] = current_segment_id
@@ -278,8 +248,6 @@ class CategoryODISE(ODISE):
                     segments_info.append(
                         {
                             "id": current_segment_id,
-                            "isthing": bool(isthing),
-                            "category_id": int(pred_class),
                         }
                     )
 
@@ -361,13 +329,12 @@ class CategoryODISE(ODISE):
         else:
 
             # get text_embeddings
-            outputs.update(self.category_head(outputs))
-            print(outputs.keys())
-            outputs["pred_logits"] = self.cal_pred_logits(outputs)
+            # outputs.update(self.category_head(outputs))
+            # print(outputs.keys())
+            # outputs["pred_logits"] = self.cal_pred_logits(outputs)
 
             mask_pred_results = outputs["pred_masks"]
             mask_cls_results = outputs["pred_logits"]
-            print(mask_cls_results)
 
             # if self.clip_head is not None:
             #     if self.clip_head.with_bg:
